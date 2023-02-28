@@ -18,7 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/arn"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	sm "github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"golang.org/x/oauth2"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,13 +35,20 @@ import (
 type request string
 
 const (
+	apply  request = "apply"
+	create request = "create"
+	remove request = "remove"
+)
+
+const (
 	fieldManager         = "lambda"
-	apply        request = "apply"
-	create       request = "create"
-	remove       request = "remove"
+	rosaProxyEnv         = "ROSA_PROXY"
+	wellKnownPath        = ".well-known/oauth-authorization-server"
+	oauthAccessTokenPath = "apis/oauth.openshift.io/v1/oauthaccesstokens"
 )
 
 type payload struct {
+	Request      request  `json:"request"`
 	K8SApiURL    string   `json:"k8s_api_url"`
 	AWSSecretARN string   `json:"aws_secret_arn"`
 	Data         []string `json:"data"`
@@ -49,10 +56,13 @@ type payload struct {
 
 type rosaCreds struct {
 	Username string `json:"username"`
-	Password string `json:"paswword"`
+	Password string `json:"password"`
 }
 
-type proxyFn func(*http.Request) (*url.URL, error)
+type SMGetSecretValueInterface interface {
+	GetSecretValue(ctx context.Context,
+		params *sm.GetSecretValueInput, optFns ...func(*sm.Options)) (*sm.GetSecretValueOutput, error)
+}
 
 // TODO: replace with actual error handling
 //
@@ -67,6 +77,9 @@ func validatePayload(p payload) error {
 
 	// what am I supposed to do with the resource
 	var op request = request(os.Getenv("request"))
+	if op == "" {
+		op = p.Request
+	}
 	switch op {
 	case apply:
 	case create:
@@ -76,12 +89,14 @@ func validatePayload(p payload) error {
 	}
 
 	// to which rosa cluster I need to send request
-	if _, err := url.Parse(p.K8SApiURL); err != nil {
+	if _, err := url.ParseRequestURI(p.K8SApiURL); err != nil {
 		return hErr(fmt.Errorf("unable to parse supplied url"))
 	}
 
 	// which secret contains creds for authenticated to rosa cluster
-	if !arn.IsARN(p.AWSSecretARN) {
+	if arn, err := arn.Parse(p.AWSSecretARN); err != nil {
+		return hErr(fmt.Errorf("incorrect AWS ARN supplied"))
+	} else if arn.Service != "secretsmanager" {
 		return hErr(fmt.Errorf("incorrect AWS Secret ARN supplied"))
 	}
 
@@ -100,31 +115,31 @@ func validatePayload(p payload) error {
 }
 
 // useful if we want to reach rosa cluster via proxy
-func setProxyFromEnv(proxy proxyFn) error {
-	var rosa_proxy = os.Getenv("ROSA_PROXY")
-	if rosa_proxy != "" {
-		proxyURL, err := url.Parse(rosa_proxy)
+func getProxyFromEnv() (*url.URL, error) {
+	var rosaProxy = os.Getenv(rosaProxyEnv)
+	var proxyURL *url.URL
+	if rosaProxy != "" {
+		var err error
+		proxyURL, err = url.ParseRequestURI(rosaProxy)
 		if err != nil {
-			return hErr(err)
+			return nil, hErr(err)
 		}
-		proxy = http.ProxyURL(proxyURL)
 	}
-	return nil
+	return proxyURL, nil
 }
 
-func getROSACreds(ctx context.Context, secretArn string) (*rosaCreds, error) {
+func getSecretValue(ctx context.Context, smClient SMGetSecretValueInterface,
+	input *sm.GetSecretValueInput) (*sm.GetSecretValueOutput, error) {
+	return smClient.GetSecretValue(ctx, input)
+}
 
-	awsCfg, err := config.LoadDefaultConfig(ctx)
-	if err != nil {
-		return nil, hErr(err)
-	}
+func getROSACreds(ctx context.Context, smClient SMGetSecretValueInterface, secretArn string) (*rosaCreds, error) {
 
-	secretSvc := secretsmanager.NewFromConfig(awsCfg)
-	input := &secretsmanager.GetSecretValueInput{
+	input := &sm.GetSecretValueInput{
 		SecretId: aws.String(secretArn),
 	}
 
-	result, err := secretSvc.GetSecretValue(ctx, input)
+	result, err := getSecretValue(ctx, smClient, input)
 	if err != nil {
 		return nil, hErr(err)
 	}
@@ -134,12 +149,17 @@ func getROSACreds(ctx context.Context, secretArn string) (*rosaCreds, error) {
 	if err != nil {
 		return nil, hErr(err)
 	}
+
+	if c.Username == "" || c.Password == "" {
+		return nil, hErr(fmt.Errorf("empty creds"))
+	}
+
 	return c, nil
 }
 
 func getAccessToken(ctx context.Context, client *http.Client, creds rosaCreds, epURL string) (string, error) {
 
-	wellKnown := fmt.Sprintf("%s/.well-known/oauth-authorization-server", epURL)
+	wellKnown := fmt.Sprintf("%s/%s", epURL, wellKnownPath)
 	req, err := http.NewRequest(http.MethodGet, wellKnown, nil)
 	if err != nil {
 		return "", hErr(err)
@@ -167,6 +187,11 @@ func getAccessToken(ctx context.Context, client *http.Client, creds rosaCreds, e
 	if err != nil {
 		return "", hErr(err)
 	}
+
+	if ai.AuthEP == "" || ai.TokenEP == "" {
+		return "", hErr(fmt.Errorf("empty oauth endpoints"))
+	}
+
 	cfg := &oauth2.Config{
 		ClientID: "openshift-challenging-client",
 		Endpoint: oauth2.Endpoint{
@@ -197,7 +222,7 @@ func getAccessToken(ctx context.Context, client *http.Client, creds rosaCreds, e
 		return "", hErr(fmt.Errorf("not '200 OK'"))
 	}
 
-	urlLocation, err := url.Parse(authCodeRes.Header.Get("Location"))
+	urlLocation, err := url.ParseRequestURI(authCodeRes.Header.Get("Location"))
 	if err != nil {
 		return "", hErr(err)
 	}
@@ -216,12 +241,12 @@ func getAccessToken(ctx context.Context, client *http.Client, creds rosaCreds, e
 
 func deleteAccessToken(client *http.Client, token string, epURL string) error {
 
-	// one way encoding to get token name in cluster from bearer token
+	// one way hashing to get token name in cluster from bearer token
 	prefix := "sha256~"
 	name := strings.TrimPrefix(token, prefix)
 	h := sha256.Sum256([]byte(name))
 	tokenName := prefix + base64.RawURLEncoding.EncodeToString(h[0:])
-	tokenURL := fmt.Sprintf("%s/apis/oauth.openshift.io/v1/oauthaccesstokens/%s", epURL, tokenName)
+	tokenURL := fmt.Sprintf("%s/%s/%s", epURL, oauthAccessTokenPath, tokenName)
 
 	req, err := http.NewRequest(http.MethodDelete, tokenURL, nil)
 	if err != nil {
@@ -233,6 +258,8 @@ func deleteAccessToken(client *http.Client, token string, epURL string) error {
 	if err != nil {
 		return hErr(err)
 	}
+
+	// TODO: decide on retry required or not as the token will anyways expire
 	if res.StatusCode != http.StatusOK {
 		resBody, _ := ioutil.ReadAll(res.Body)
 		fmt.Println(string(resBody))
@@ -276,6 +303,7 @@ func doApply(ctx context.Context, dri dynamic.ResourceInterface, obj *unstructur
 }
 
 func doCreate(ctx context.Context, dri dynamic.ResourceInterface, obj *unstructured.Unstructured) error {
+	// TODO: query resource existing before creating it?
 	_, err := dri.Create(ctx, obj, metav1.CreateOptions{FieldManager: fieldManager})
 	if err != nil {
 		return hErr(err)
@@ -284,6 +312,7 @@ func doCreate(ctx context.Context, dri dynamic.ResourceInterface, obj *unstructu
 }
 
 func doRemove(ctx context.Context, dri dynamic.ResourceInterface, obj *unstructured.Unstructured) error {
+	// TODO: query resource existing before deleting it?
 	err := dri.Delete(ctx, obj.GetName(), metav1.DeleteOptions{})
 	if err != nil {
 		return hErr(err)
@@ -298,8 +327,15 @@ func HandleRequest(ctx context.Context, p payload) (string, error) {
 		return "", hErr(err)
 	}
 
+	// create AWS Secretsmanager Client
+	awsCfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return "", hErr(err)
+	}
+	smClient := sm.NewFromConfig(awsCfg)
+
 	// get rosa login details
-	creds, err := getROSACreds(ctx, p.AWSSecretARN)
+	creds, err := getROSACreds(ctx, smClient, p.AWSSecretARN)
 	if err != nil {
 		return "", hErr(err)
 	}
@@ -310,8 +346,10 @@ func HandleRequest(ctx context.Context, p payload) (string, error) {
 			InsecureSkipVerify: true,
 		},
 	}
-	if err := setProxyFromEnv(tp.Proxy); err != nil {
+	if p, err := getProxyFromEnv(); err != nil {
 		return "", hErr(err)
+	} else {
+		tp.Proxy = http.ProxyURL(p)
 	}
 	hc := &http.Client{
 		Transport: tp,
@@ -337,9 +375,10 @@ func HandleRequest(ctx context.Context, p payload) (string, error) {
 		BearerToken: token,
 		UserAgent:   fieldManager,
 	}
-	err = setProxyFromEnv(rc.Proxy)
-	if err != nil {
+	if p, err := getProxyFromEnv(); err != nil {
 		return "", hErr(err)
+	} else {
+		rc.Proxy = http.ProxyURL(p)
 	}
 
 	// client to lazily discover resources that are available in api server
@@ -363,9 +402,12 @@ func HandleRequest(ctx context.Context, p payload) (string, error) {
 	//
 	// all ops fail on first error
 	var op request = request(os.Getenv("request"))
+	if op == "" {
+		op = p.Request
+	}
 	for _, d := range p.Data {
 
-		// the returned dynamic client knows how to interact with the supplied resource
+		// the returned dynamic client interface knows how to interact with the supplied resource
 		dri, obj, err := getResourceClient(d, dc, serializer, mapper)
 		if err != nil {
 			return "", hErr(err)
