@@ -16,6 +16,15 @@
                 "lambda:DeleteFunction"
             ],
             "Resource": "@lambda-res@"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ec2:DescribeInstances",
+                "ec2:DescribeSubnets",
+                "ec2:DescribeSecurityGroups"
+            ],
+            "Resource": "*"
         }
     ]
 }

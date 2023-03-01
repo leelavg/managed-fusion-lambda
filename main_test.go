@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -74,7 +73,7 @@ func TestGetProxyFromEnv(t *testing.T) {
 				t.Error("proxy is not parsed")
 			}
 
-			if tt.shouldSet && fmt.Sprintf("%s", p) != tt.proxy {
+			if tt.shouldSet && fmt.Sprint(p) != tt.proxy {
 				t.Error("incorrect proxy set")
 			} else if !tt.shouldSet && p != nil {
 				t.Error("proxy shouldn't be set")
@@ -192,7 +191,7 @@ func TestGetAccessToken(t *testing.T) {
 		}
 		res.Header().Set("Content-Type", "application/json")
 		res.WriteHeader(item.status)
-		io.WriteString(res, item.body)
+		fmt.Fprintf(res, item.body)
 	}))
 	ts.Listener.Close()
 	l, err := net.Listen("tcp", listenURL)
