@@ -9,6 +9,7 @@ CUSTOMER_AWS_ADMIN_PROFILE ?= customer
 VENDOR_AWS_ADMIN_PROFILE ?= vendor
 ROSA_CLUSTER_NAME ?= invalid-cluster-name
 ROSA_USER ?= faas
+ROSA_PROXY ?= ""
 
 temp := nocommit
 out := bin
@@ -271,48 +272,7 @@ ${temp}/.lambda-exec-role-cleanup: # Remove lambda runtime role
 
 	touch $@
 
-${temp}/.ec2-describe-role-setup: # Role to get subnets & security groups attached to ec2
-	@export AWS_PROFILE=${CUSTOMER_AWS_ADMIN_PROFILE}
-
-	@echo create ec2 describe role
-	@role_arn=$$(jq -r .Role.Arn ${temp}/switch-role)
-	@aws iam create-role \
-	--assume-role-policy-document "$$(jq -c --arg role_arn $$role_arn \
-	'.Statement[0].Principal.AWS=$$role_arn' \
-	aws/customer/ec2-describe-trust-policy.json)" \
-	--role-name ec2-describe-role > ${temp}/ec2-describe-role
-
-	@echo create ec2 describe role policy
-	@aws iam create-policy \
-	--policy-document file://aws/customer/ec2-describe-role-policy.json \
-	--policy-name ec2-describe-role-policy > ${temp}/ec2-describe-role-policy
-
-	@echo attach ec2 describe role policy
-	@aws iam attach-role-policy \
-	--policy-arn $$(jq -r .Policy.Arn ${temp}/ec2-describe-role-policy) \
-	--role-name ec2-describe-role
-
-	touch $@
-
-${temp}/.ec2-describe-role-cleanup: # Cleanup role which can query subnets & SGs of ec2
-	@export AWS_PROFILE=${CUSTOMER_AWS_ADMIN_PROFILE}
-
-	@echo detach ec2 describe role policy
-	@aws iam detach-role-policy \
-	--policy-arn $$(jq -r .Policy.Arn ${temp}/ec2-describe-role-policy) \
-	--role-name ec2-describe-role
-
-	@echo delete ec2 describe role policy
-	@aws iam delete-policy \
-	--policy-arn $$(jq -r .Policy.Arn ${temp}/ec2-describe-role-policy)
-
-	@echo delete ec2 describe role
-	@aws iam delete-role \
-	--role-name ec2-describe-role
-
-	touch $@
-
-customer := secret lambda lambda-exec ec2-describe
+customer := secret lambda lambda-exec
 customer-setup-targets :=  $(foreach t,$(customer),${temp}/.$(t)-role-setup)
 customer-cleanup-targets :=  $(foreach t,$(customer),${temp}/.$(t)-role-cleanup)
 
@@ -322,7 +282,6 @@ customer-setup: $(customer-setup-targets)  ## Setup necessary permissions for cu
 customer-cleanup: $(customer-cleanup-targets)  ## Cleanup permissions for customer to stop using faas
 	@rm -f ${temp}/secret-*
 	@rm -f ${temp}/lambda-*
-	@rm -f ${temp}/ec2-describe-*
 	@rm -f ${temp}/customer-identity
 	@rm -f $(customer-setup-targets)
 
@@ -359,11 +318,6 @@ ${temp}/aws: # Create aws config and credentials files for role chaining
 	@aws configure set role_arn $${lambda_exec_role_arn} --profile lambda-exec-role
 	@aws configure set source_profile switch-role --profile lambda-exec-role
 
-	@echo creating ec2 describe role profile
-	@ec2_describe_role_arn=$$(jq -r .Role.Arn ${temp}/ec2-describe-role)
-	@aws configure set role_arn $${ec2_describe_role_arn} --profile ec2-describe-role
-	@aws configure set source_profile switch-role --profile ec2-describe-role
-
 	touch $@
 
 profile-setup: ${temp}/aws ## Setup profile for vendor to assume customer roles
@@ -373,12 +327,12 @@ profile-cleanup: ## Cleanup profile of vendor which assumes customer roles
 ##@ ROSA User Operations
 .PHONY: rosa-user-setup rosa-user-cleanup
 
-${cpath}-setup-password: # Generates a password for rosa user
+${temp}/.${rcname}-setup-password: # Generates a password for rosa user
 	@password=$$(cat /dev/urandom | tr -dc A-Za-z0-9 | head -c 20 | sed -re 's,(.{5}),\1-,g' -e 's,-$$,,')
 	@echo $$password > $@
 
 # TODO: make idempotent if possible
-${cpath}-setup-user: ${cpath}-setup-password # Creates and add user to dedicated-admin group
+${temp}/.${rcname}-setup-user: ${temp}/.${rcname}-setup-password # Creates and add user to dedicated-admin group
 	@export AWS_CONFIG_FILE=${temp}/aws-config
 	@export AWS_SHARED_CREDENTIALS_FILE=${temp}/aws-creds
 	@export AWS_REGION=$$(jq -r .region.id ${cpath})
@@ -393,7 +347,7 @@ ${cpath}-setup-user: ${cpath}-setup-password # Creates and add user to dedicated
 	touch $@
 
 # TODO: delete idp only if no other user exists
-${cpath}-cleanup-user:
+${temp}/.${rcname}-cleanup-user:
 	@export AWS_CONFIG_FILE=${temp}/aws-config
 	@export AWS_SHARED_CREDENTIALS_FILE=${temp}/aws-creds
 	@export AWS_REGION=$$(jq -r .region.id ${cpath})
@@ -406,19 +360,20 @@ ${cpath}-cleanup-user:
 
 	touch $@
 
-rosa-setup-targets := ${cpath} ${cpath}-setup-user
-rosa-cleanup-targets := ${cpath} ${cpath}-cleanup-user
+rosa-setup-targets := ${cpath} ${temp}/.${rcname}-setup-user
+rosa-cleanup-targets := ${cpath} ${temp}/.${rcname}-cleanup-user
 
 rosa-user-setup: $(rosa-setup-targets) ## Setup a user in dedicated admin group with htpasswd idp
 	@rm -f $(rosa-cleanup-targets)
 
 rosa-user-cleanup: $(rosa-cleanup-targets) ## Cleanup user from dedicated admin group along with htpasswd idp
 	@rm -f $(rosa-setup-targets)
-	@rm -f ${cpath}-setup-password
+	@rm -f ${temp}/.${rcname}-setup-password
+	@rm -f ${cpath}
 
 ##@ AWS Lambda
-.PHONY: remote-deploy remote-run stop-lambda restart-lambda local-deploy \
-	local-run secret-setup secret-cleanup lambda-setup lambda-cleanup
+.PHONY: secret-setup secret-cleanup lambda-setup lambda-cleanup remote-deploy \
+	remote-run stop-lambda restart-lambda local-deploy local-run
 
 ${temp}/.secret-setup: ${cpath} # Upload rosa user creds to AWS Secretsmanager
 	@export AWS_CONFIG_FILE=${temp}/aws-config
@@ -428,8 +383,8 @@ ${temp}/.secret-setup: ${cpath} # Upload rosa user creds to AWS Secretsmanager
 
 	@secret=faas-${rcname}
 
-	@pass=$$(cat ${cpath}-setup-password)
-	aws secretsmanager create-secret \
+	@pass=$$(cat ${temp}/.${rcname}-setup-password)
+	@aws secretsmanager create-secret \
 	--name $$secret --secret-string \
 	"$$(jq -nc --arg user "${ROSA_USER}" --arg pass "$$pass" \
 		'{"username": $$user, "password": $$pass}')"
@@ -468,8 +423,8 @@ ${temp}/.lambda-setup: ${cpath} build # Upload lambda code
 	@export AWS_CONFIG_FILE=${temp}/aws-config
 	@export AWS_SHARED_CREDENTIALS_FILE=${temp}/aws-creds
 	@export AWS_REGION=$$(jq -r .region.id ${cpath})
+	@export AWS_PROFILE=lambda-role
 
-	@export AWS_PROFILE=ec2-describe-role
 	@infra_id=$$(jq -r .infra_id ${cpath})
 	@subnets=$$(aws ec2 describe-instances \
 	  --filters Name=tag:Name,Values=$$infra_id-master-* \
@@ -480,13 +435,12 @@ ${temp}/.lambda-setup: ${cpath} build # Upload lambda code
 	  --query 'Reservations[*].Instances[*].SecurityGroups[*].GroupId' \
 	  | jq -r '.[]|.[]|.[]' | sed -rze 's/\n/,/g' -e 's|,$$||')
 
-	@export AWS_PROFILE=lambda-role
 	@lambda_arn=$$(jq -r .Role.Arn ${temp}/lambda-exec-role)
 	@aws lambda create-function \
 	--runtime go1.x --role $$lambda_arn --handle main \
 	--vpc-config SubnetIds=$$subnets,SecurityGroupIds=$$sgs \
 	--zip-file fileb://${out}/main.zip \
-	--function-name faas-lambda
+	--function-name faas-${rcname} > ${temp}/.faas-${rcname}
 
 	touch $@
 
@@ -496,7 +450,8 @@ ${temp}/.lambda-cleanup: ${cpath} # Delete lambda code
 	@export AWS_REGION=$$(jq -r .region.id ${cpath})
 	@export AWS_PROFILE=lambda-role
 
-	@aws lambda delete-function --function-name faas-lambda
+	@aws logs delete-log-group --log-group-name /aws/lambda/faas-${rcname}
+	@aws lambda delete-function --function-name faas-${rcname}
 
 	touch $@
 
@@ -507,26 +462,39 @@ lambda-setup: $(lambda-setup-targets) ## Create lambda function
 	@rm -f $(lambda-cleanup-targets)
 
 lambda-cleanup: $(lambda-cleanup-targets) ## Delete lambda function
-	@rm -f $(lambda-setup-tragets)
+	@rm -f $(lambda-setup-targets)
+	@rm -f ${temp}/.faas-${rcname}
+	@rm -f ${temp}/response.json
+
+# quickly select with what payload we want to invoke lambda function
+payloads = apply create remove
+define payload_template =
+payload-$(1):
+	@ln -srf ${temp}/$$@.json ${temp}/payload.json
+	@echo Current payload is set to [${temp}/$$@.json]
+endef
+$(foreach load,$(payloads),$(eval $(call payload_template,$(load))))
 
 remote-deploy: ${cpath} build ## Deploy lambda on AWS
 	@export AWS_CONFIG_FILE=${temp}/aws-config
 	@export AWS_SHARED_CREDENTIALS_FILE=${temp}/aws-creds
 	@export AWS_REGION=$$(jq -r .region.id ${cpath})
+	@export AWS_PROFILE=lambda-role
 
-	@aws lambda --profile customer update-function-code \
-	  --function-name faas-lambda --zip-file fileb://bin/main.zip > /dev/null
+	@aws lambda update-function-code \
+	  --function-name faas-${rcname} --zip-file fileb://${out}/main.zip > /dev/null
 
-remote-run: ## Invoke lambda on AWS
+remote-run: ${cpath} ## Invoke lambda on AWS
 	@export AWS_CONFIG_FILE=${temp}/aws-config
 	@export AWS_SHARED_CREDENTIALS_FILE=${temp}/aws-creds
 	@export AWS_REGION=$$(jq -r .region.id ${cpath})
+	@export AWS_PROFILE=lambda-role
 
-	@aws lambda --profile customer invoke \
+	@aws lambda invoke \
 	  --cli-binary-format raw-in-base64-out \
-	  --payload "$$(jq -c . in/lambda-payload.json)" \
-	  --function-name faas-lambda \
-	  ${tmp}/response.json
+	  --payload "$$(jq -c . ${temp}/payload.json)" \
+	  --function-name faas-${rcname} \
+	  ${temp}/response.json
 
 stop-lambda: ## Stop lambda rie in docker
 	@docker rm lambda -f >/dev/null 2>&1
@@ -535,7 +503,11 @@ restart-lambda: stop-lambda ## (Re)start lambda rie in docker
 	@docker run --name lambda -d --restart on-failure \
 	-p 9001:8080 \
 	-v $(PWD)/bin:/var/task:ro,delegated \
-	-v ~/.aws:/root/.aws:ro,delegated \
+	-v $(PWD)/${temp}/aws-config:/root/.aws/config:ro,delegated \
+	-v $(PWD)/${temp}/aws-creds:/root/.aws/credentials:ro,delegated \
+	-e AWS_REGION=$$(jq -r .region.id ${cpath}) \
+	-e AWS_PROFILE=secret-role \
+	-e ROSA_PROXY=${ROSA_PROXY} \
 	public.ecr.aws/lambda/go:1 main >/dev/null
 
 local-deploy: build restart-lambda ## Deploy lambda in docker
@@ -544,12 +516,13 @@ local-run: ## Invoke lambda in docker
 	@export AWS_CONFIG_FILE=${temp}/aws-config
 	@export AWS_SHARED_CREDENTIALS_FILE=${temp}/aws-creds
 	@export AWS_REGION=$$(jq -r .region.id ${cpath})
+	@export AWS_PROFILE=lambda-role
 
-	@aws lambda --profile customer invoke \
+	@aws lambda invoke \
 	  --cli-binary-format raw-in-base64-out \
-	  --payload "$$(jq -c . in/lambda-payload.json)" \
+	  --payload "$$(jq -c . ${temp}/payload.json)" \
 	  --function-name function \
-	  out/response.json \
+	  ${temp}/response.json \
 	  --endpoint http://localhost:9001 --no-sign-request
 
 ##@ Golang

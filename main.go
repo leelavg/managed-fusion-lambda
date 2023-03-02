@@ -218,8 +218,8 @@ func getAccessToken(ctx context.Context, client *http.Client, creds rosaCreds, e
 	if err != nil {
 		return "", hErr(err)
 	}
-	if authCodeRes.StatusCode != http.StatusOK {
-		return "", hErr(fmt.Errorf("not '200 OK'"))
+	if authCodeRes.StatusCode != http.StatusFound {
+		return "", hErr(fmt.Errorf("not '302 StatusFound'"))
 	}
 
 	urlLocation, err := url.ParseRequestURI(authCodeRes.Header.Get("Location"))

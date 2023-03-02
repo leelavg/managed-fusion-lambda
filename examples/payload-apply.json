@@ -1,0 +1,8 @@
+{
+  "request": "apply",
+  "k8s_api_url": "<API_URL>",
+  "aws_secret_arn": "<SECRET_ARN>",
+  "data": [
+    "{\"kind\":\"ConfigMap\",\"apiVersion\":\"v1\",\"metadata\":{\"name\":\"test\",\"namespace\":\"test-proj\"},\"data\":{\"key1\":\"config1\"}}"
+  ]
+}

@@ -20,9 +20,30 @@
         {
             "Effect": "Allow",
             "Action": [
+                "iam:GetRole",
+                "iam:PassRole"
+            ],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "iam:PassedToService": "lambda.amazonaws.com"
+                }
+            }
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
                 "ec2:DescribeInstances",
                 "ec2:DescribeSubnets",
-                "ec2:DescribeSecurityGroups"
+                "ec2:DescribeSecurityGroups",
+                "ec2:DescribeVpcs"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:DeleteLogGroup"
             ],
             "Resource": "*"
         }

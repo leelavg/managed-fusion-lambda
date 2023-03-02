@@ -146,6 +146,7 @@ func TestGetROSACreds(t *testing.T) {
 	}
 }
 
+// TODO: implement mock oauth server if required at some point
 func TestGetAccessToken(t *testing.T) {
 
 	type r struct {
@@ -190,8 +191,13 @@ func TestGetAccessToken(t *testing.T) {
 			}
 		}
 		res.Header().Set("Content-Type", "application/json")
-		res.WriteHeader(item.status)
-		fmt.Fprintf(res, item.body)
+
+		// this is when we need to provide redirect location
+		if req.URL.Query().Get("state") != "" {
+			res.WriteHeader(302)
+		} else {
+			fmt.Fprintf(res, item.body)
+		}
 	}))
 	ts.Listener.Close()
 	l, err := net.Listen("tcp", listenURL)
@@ -225,6 +231,7 @@ func TestGetAccessToken(t *testing.T) {
 			if tt.shouldFail && err == nil {
 				t.Error("incorrect token acquired")
 			} else if !tt.shouldFail && token == "" {
+				fmt.Println(err)
 				t.Error("empty token received")
 			}
 		})
